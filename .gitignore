@@ -1,0 +1,8 @@
+/target
+# Model weights are not distributed with this project - see the README for where
+# to download them.
+/models/
+
+# Not tracked on purpose: this engine depends on lightgpu by git, and the family
+# builds against the toolkit as it stands rather than a frozen revision.
+Cargo.lock
