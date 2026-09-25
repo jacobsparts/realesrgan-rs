@@ -29,11 +29,14 @@ OPTIONS:
     -m, --model <path>    converted .safetensors checkpoint (see tools/convert.py)
     -i, --input <path>    input PNG, or - for stdin (default: stdin)
     -o, --output <path>   output PNG, or - for stdout (default: stdout)
-        --device <dev>    gpu or cpu (default: the CUDA build uses gpu, a
-                          CPU-only build uses cpu)
+        --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
+                          brought up, cpu otherwise; a CPU-only build is always
+                          cpu)
         --tile <n>        process in tiles of n pixels, 0 = whole image (default 0)
         --tile-pad <n>    overlap around each tile (default 10)
         --outscale <f>    resize the result to this final scale (default: model scale)
+        --cpu             same as --device cpu
+        --gpu             same as --device gpu, and refuses to fall back
     -q, --quiet           no progress output
         --cuda-selftest   compare each CUDA kernel against its CPU twin and exit
         --self-test       run the CPU graph's internal checks and exit
@@ -54,6 +57,10 @@ fn main() {
     // A CPU-only build has no GPU backend to default to, so it defaults to the
     // one it can actually run.
     let mut device = if cfg!(feature = "cuda") { "gpu" } else { "cpu" }.to_string();
+    // Set only when the caller NAMED the GPU. Without it, a GPU that cannot be
+    // brought up is not fatal: the engine falls back to the CPU backend, which
+    // is what lets one binary run on a machine with no NVIDIA driver at all.
+    let mut force_gpu = false;
     let mut tile = 0usize;
     let mut tile_pad = 10usize;
     let mut outscale: Option<f64> = None;
@@ -81,6 +88,12 @@ fn main() {
             "--device" => {
                 i += 1;
                 device = args.get(i).cloned().unwrap_or_else(|| usage());
+                force_gpu = device == "gpu";
+            }
+            "--cpu" => device = "cpu".to_string(),
+            "--gpu" => {
+                device = "gpu".to_string();
+                force_gpu = true;
             }
             "--tile" => {
                 i += 1;
@@ -116,9 +129,10 @@ fn main() {
         i += 1;
     }
     // Both tiling flags are parsed in every build so the CLI surface does not
-    // change with the feature set, but only the GPU path can tile; the CPU-only
-    // build reads neither value, hence the discard.
-    let _ = (tile, tile_pad);
+    // change with the feature set, but only the GPU path can tile and only it
+    // can fall back, so the CPU-only build reads none of the three, hence the
+    // discard.
+    let _ = (tile, tile_pad, force_gpu);
 
     let model_path = model_path.unwrap_or_else(|| usage());
     let t_load = Instant::now();
@@ -239,45 +253,41 @@ fn main() {
 
     let t_fwd = Instant::now();
     let out = match device.as_str() {
-        "cpu" => {
-            let p = net::Plane {
-                c: 3,
-                h: img.h,
-                w: img.w,
-                data: img.data.clone(),
-            };
-            let mut n = 0;
-            let mut progress = |s: &str| {
-                if !quiet {
-                    n += 1;
-                    eprintln!("  [{n}] {s}");
-                }
-            };
-            let r = net::forward_cpu(&model, &p, &mut progress);
-            net::cpu_profile_report();
-            r
-        }
+        "cpu" => run_cpu(&model, &img, quiet),
         "gpu" => {
             #[cfg(not(feature = "cuda"))]
             {
+                // A CPU-only build is never asked for the GPU by this engine
+                // itself (it defaults to cpu), so reaching here means the caller
+                // named it; running the CPU engine instead would misreport what
+                // was measured.
                 eprintln!("error: this binary was built without the `cuda` feature; use --device cpu");
                 std::process::exit(1);
             }
             #[cfg(feature = "cuda")]
-            let cuda = match cuda::Cuda::init(!quiet) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(1)
-                }
-            };
-            #[cfg(feature = "cuda")]
             {
-                match forward_tiled(cuda, model, &img, tile, tile_pad, quiet) {
-                    Ok(v) => v,
-                    Err(e) => {
+                match cuda::Cuda::init(!quiet) {
+                    Ok(cuda) => match forward_tiled(cuda, model, &img, tile, tile_pad, quiet) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("error: {e}");
+                            std::process::exit(1)
+                        }
+                    },
+                    // NAMING THE GPU IS A REQUEST; NOT NAMING IT IS NOT. gpu is
+                    // the default, so a machine with no driver must still work:
+                    // the driver failing to come up is not an error unless the
+                    // caller asked for the GPU by name.
+                    Err(e) if force_gpu => {
                         eprintln!("error: {e}");
                         std::process::exit(1)
+                    }
+                    Err(e) => {
+                        if !quiet {
+                            eprintln!("cuda: {e}");
+                            eprintln!("cuda: falling back to the CPU backend (--gpu forces the GPU)");
+                        }
+                        run_cpu(&model, &img, quiet)
                     }
                 }
             }
@@ -316,6 +326,31 @@ fn main() {
         let dst = if output == "-" { "stdout".to_string() } else { output.clone() };
         eprintln!("wrote {} ({}x{})", dst, result.w, result.h);
     }
+}
+
+/// The CPU forward pass.
+///
+/// One function rather than a block inside the match, because it runs on two
+/// paths that must agree: `--device cpu`, and the fallback from a GPU that could
+/// not be brought up. A second copy would be a second set of progress output to
+/// keep in step.
+fn run_cpu(model: &net::Model, img: &image::Image, quiet: bool) -> net::Plane {
+    let p = net::Plane {
+        c: 3,
+        h: img.h,
+        w: img.w,
+        data: img.data.clone(),
+    };
+    let mut n = 0;
+    let mut progress = |s: &str| {
+        if !quiet {
+            n += 1;
+            eprintln!("  [{n}] {s}");
+        }
+    };
+    let r = net::forward_cpu(model, &p, &mut progress);
+    net::cpu_profile_report();
+    r
 }
 
 /// The GPU forward pass, tiled when asked.

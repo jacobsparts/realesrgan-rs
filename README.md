@@ -40,10 +40,12 @@ This is the same network, rewritten as an engine:
   one every engine in the family uses. No pickle, no deserialisation, no per-run
   parse: the architecture constants come from the file header and every tensor is
   shape-checked against them at load.
-* **A CPU backend that is actually tuned.** `--device cpu` is the fallback for a
-  machine with no GPU or driver - the same graph in plain Rust (no CUDA, no
-  driver): avx2 kernels with output-channel blocking, 24 threads, about 6x faster
-  than the reference on CPU.
+* **A CPU backend that is actually tuned, and the automatic fallback.** The GPU
+  is used when the CUDA driver can be brought up, and the same graph in plain
+  Rust (no CUDA, no driver) runs otherwise - avx2 kernels with output-channel
+  blocking, 24 threads, about 6x faster than the reference on CPU. `--device cpu`
+  asks for it outright; `--gpu` (or `--device gpu`) demands the GPU and makes a
+  driver that will not load fatal instead.
 * **Tiling for images that do not fit in VRAM**, with the fidelity cost
   documented rather than hidden (see below).
 * **Byte-level agreement with the reference.** On the same input, both models
@@ -99,8 +101,10 @@ where it comes from.
 Prebuilt binaries and converted models are attached to the
 [GitHub release](https://github.com/jacobsparts/realesrgan-rs/releases/latest):
 
-* `realesrgan-linux-x86_64` — CUDA-enabled binary; needs an NVIDIA driver to use
-  the GPU and also supports `--device cpu`.
+* `realesrgan-linux-x86_64` — CUDA-enabled binary. It uses the GPU when the
+  driver can be brought up and falls back to the CPU backend when it cannot, so
+  the one binary covers a machine with no NVIDIA driver at all; `--device cpu`
+  forces the CPU, `--gpu` forces the GPU and refuses to fall back.
 * `realesrgan-linux-x86_64-cpu-only` — CPU-only binary; no CUDA toolkit or NVIDIA
   driver is needed.
 * `RealESRGAN_x4plus.safetensors`, `RealESRGAN_x2plus.safetensors`,
@@ -181,7 +185,8 @@ convert in.png -resize 200% png:- | realesrgan -m RealESRGAN_x4plus.safetensors 
 | --- | --- |
 | `-m, --model` | converted `.safetensors` checkpoint |
 | `-i, --input` / `-o, --output` | PNG in / PNG out (8- or 16-bit in, 8-bit RGB out); `-` or omitted means stdin/stdout |
-| `--device` | `gpu` or `cpu` (a CPU-only build defaults to `cpu`) |
+| `--device` | `gpu` or `cpu` (default: `gpu` when the CUDA driver can be brought up, `cpu` otherwise; a CPU-only build is always `cpu`) |
+| `--cpu` / `--gpu` | shorthands for the two, and `--gpu` refuses to fall back |
 | `--tile` | process in tiles of this many input pixels; `0` = whole image |
 | `--tile-pad` | context added around each tile, in input pixels (default 10) |
 | `--outscale` | resize the result to this final scale (separable Lanczos-4) |
