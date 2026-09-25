@@ -1,4 +1,5 @@
-//! The RRDBNet graph: geometry, weights, and the CPU twin of the GPU kernels.
+//! The RRDBNet graph: geometry, weights, and the CPU kernels that mirror the
+//! GPU ones.
 //!
 //! The architecture is 350 3x3 convolutions with LeakyReLU(0.2), arranged as
 //! 23 RRDB blocks (each 3 residual-dense blocks, each 5 convs), then a body

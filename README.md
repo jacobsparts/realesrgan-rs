@@ -39,9 +39,10 @@ This is the same network, rewritten as an engine:
   one every engine in the family uses. No pickle, no deserialisation, no per-run
   parse: the architecture constants come from the file header and every tensor is
   shape-checked against them at load.
-* **A CPU backend that is actually tuned.** `--device cpu` is the same graph in
-  plain Rust (no CUDA, no GPU, no driver): avx2 kernels with output-channel
-  blocking, 24 threads, about 6x faster than the reference on CPU.
+* **A CPU backend that is actually tuned.** `--device cpu` is the fallback for a
+  machine with no GPU or driver - the same graph in plain Rust (no CUDA, no
+  driver): avx2 kernels with output-channel blocking, 24 threads, about 6x faster
+  than the reference on CPU.
 * **Tiling for images that do not fit in VRAM**, with the fidelity cost
   documented rather than hidden (see below).
 * **Byte-level agreement with the reference.** On the same input, both models
@@ -60,11 +61,13 @@ is what this project contributes back to.
   fastest direct convolution the hardware can run, and promoted into the
   toolkit's shared kernel set, where any engine can call it.
 * **Kernels are compiled per consumer.** A binary embeds only the kernels it
-  calls: this engine's fatbin carries 11 of the toolkit's 42, in two separately
-  loaded modules, so a name collision or a mis-filed kernel fails at build time
-  rather than mid-inference.
-* **Every kernel has a CPU twin** that it is checked against on random data, so
-  the GPU path can be validated without a reference image.
+  calls: this engine's fatbins carry 10 of the toolkit's 48 kernels plus one of
+  its own, in two separately loaded modules, so a name collision or a mis-filed
+  kernel fails at build time rather than mid-inference.
+* **Every kernel has a CPU twin** it is checked against on random data
+  (`--cuda-selftest`), which is a development-time check of the arithmetic, not
+  the correctness record: that is the golden fixtures and the PyTorch comparison
+  under Accuracy.
 * **Nothing to install to run it.** The driver bindings are `dlopen`ed at run
   time, so the binary links no CUDA library and the GPU backend works on any
   machine with a driver - no toolkit, no headers. `--no-default-features` builds
