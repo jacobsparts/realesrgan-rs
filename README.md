@@ -2,8 +2,9 @@
 
 One of the [lightgpu inference engines](https://github.com/jacobsparts/lightgpu).
 The family also includes [rmbg-rs](https://github.com/jacobsparts/rmbg-rs),
-[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs) and
-[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs); they
+[locate-anything-rs](https://github.com/jacobsparts/locate-anything-rs),
+[lama-inpaint-rs](https://github.com/jacobsparts/lama-inpaint-rs) and
+[nafnet-rs](https://github.com/jacobsparts/nafnet-rs); they
 share the [lightgpu toolkit](https://github.com/jacobsparts/lightgpu).
 [pixeldeck](https://github.com/jacobsparts/pixeldeck) is a local web app for
 cleaning up product photos that drives all of these engines.
