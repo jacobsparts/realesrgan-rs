@@ -283,10 +283,12 @@ fn main() {
                         std::process::exit(1)
                     }
                     Err(e) => {
-                        if !quiet {
-                            eprintln!("cuda: {e}");
-                            eprintln!("cuda: falling back to the CPU backend (--gpu forces the GPU)");
-                        }
+                        // NOT PROGRESS OUTPUT, SO `--quiet` DOES NOT SILENCE IT.
+                        // Which backend ran is a property of the result, like a
+                        // warning, and a caller that asked for quiet to keep its
+                        // logs small still needs to know it got the CPU.
+                        eprintln!("cuda: {e}");
+                        eprintln!("cuda: falling back to the CPU backend (--gpu forces the GPU)");
                         run_cpu(&model, &img, quiet)
                     }
                 }
