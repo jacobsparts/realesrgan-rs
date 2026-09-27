@@ -49,10 +49,15 @@ This is the same network, rewritten as an engine:
   shape-checked against them at load.
 * **A CPU backend that is actually tuned, and the automatic fallback.** The GPU
   is used when the CUDA driver can be brought up, and the same graph in plain
-  Rust (no CUDA, no driver) runs otherwise - avx2 kernels with output-channel
-  blocking, 24 threads, about 6x faster than the reference on CPU. `--device cpu`
-  asks for it outright; `--gpu` (or `--device gpu`) demands the GPU and makes a
-  driver that will not load fatal instead.
+  Rust (no CUDA, no driver) runs otherwise - AVX2 at runtime, 24 threads, about
+  6x faster than the reference on CPU. The convolutions are the toolkit's own
+  twins (`lightgpu::ops::cpu`), measured there and shared with the rest of the
+  family rather than kept as a second copy here: 179 GFLOP/s on 192->64 at
+  256x256 against 168 for the hand-written kernel they replaced, and the whole
+  network reproduces the scalar reference to round-off (see the note on the two
+  orders below). `--device cpu` asks for it outright; `--gpu` (or
+  `--device gpu`) demands the GPU and makes a driver that will not load fatal
+  instead.
 * **Tiling for images that do not fit in VRAM**, with the fidelity cost
   documented rather than hidden (see below).
 * **Byte-level agreement with the reference.** On the same input, both models
@@ -71,13 +76,21 @@ is what this project contributes back to.
   fastest direct convolution the hardware can run, and promoted into the
   toolkit's shared kernel set, where any engine can call it.
 * **Kernels are compiled per consumer.** A binary embeds only the kernels it
-  calls: this engine's fatbins carry 10 of the toolkit's 55 kernels plus one of
+  calls: this engine's fatbins carry 10 of the toolkit's 57 kernels plus one of
   its own, in two separately loaded modules, so a name collision or a mis-filed
   kernel fails at build time rather than mid-inference.
 * **Every kernel has a CPU twin** it is checked against on random data
   (`--cuda-selftest`), which is a development-time check of the arithmetic, not
   the correctness record: that is the golden fixtures and the PyTorch comparison
-  under Accuracy.
+  under Accuracy. This engine's own `lg_conv3x3_res` is compared against the
+  toolkit's 3x3 twin, so the CPU side of that check is the same kernel the CPU
+  backend runs rather than an extra copy.
+* **The CPU convolutions are the toolkit's, not this engine's.** That check above
+  is only meaningful while the twin is the kernel the CPU backend actually runs,
+  and it now is: the hand-written row-band AVX2 3x3 with channel blocking is gone,
+  and `lightgpu::ops::cpu::conv3x3s1p1` is the only CPU convolution in the tree -
+  the same one nafnet-rs, rmbg-rs, maxim-rs, scunet-rs, ifan-rs and swin2sr-rs
+  call.
 * **Nothing to install to run it.** The driver bindings are `dlopen`ed at run
   time, so the binary links no CUDA library and the GPU backend works on any
   machine with a driver - no toolkit, no headers. `--no-default-features` builds

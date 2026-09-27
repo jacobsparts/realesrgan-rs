@@ -22,14 +22,24 @@
 //! takes a base pointer plus a channel count, so "the concatenation" costs
 //! nothing, and the workspace is allocated once and reused by all 69 blocks.
 //!
-//! WEIGHT LAYOUT. The checkpoint stores conv weights as [c_out][c_in][3][3],
-//! which is what the CUDA kernel wants; the CPU twin needs a second, ci-innermost
-//! copy (see `Conv::w_cpu_ci`), made once at load. Both backends accumulate in
-//! (ky, kx, ci) order, which is what makes them agree on these short
-//! reductions.
+//! WEIGHT LAYOUT. The checkpoint stores conv weights as [c_out][c_in][3][3] -
+//! `[oc][ci][ky][kx]` with the nine taps innermost - and that is the layout BOTH
+//! backends take now: the CUDA kernel indexes it directly and
+//! `lightgpu::ops::cpu::conv3x3s1p1` taps it as `w[(oc*c_in + ci)*9 + ky*3 + kx]`.
+//! A second, ci-innermost copy used to be built for a private CPU kernel; the
+//! kernel is gone and so is the copy. Both backends accumulate in (ky, kx, ci)
+//! order, which is what makes them agree on these short reductions.
 
 use crate::weights::Weights;
-use rayon::prelude::*;
+
+/// The lightgpu convolution twins. These are the whole reason this engine no
+/// longer carries a convolution kernel of its own: `lightgpu/src/ops/cpu.rs`
+/// holds ONE measured parallel + AVX2 3x3 and one 1x1, and every engine in the
+/// family uses them rather than keeping a private copy that drifts. The section
+/// below is the reference implementation the CUDA selftest and `--bench-conv`
+/// still measure against, and the fallback for shapes the twin does not take.
+use lightgpu::ops::cpu::conv3x3s1p1 as lg_conv3x3s1p1;
+
 
 /// Model geometry, read from the checkpoint metadata.
 #[derive(Clone, Debug)]
@@ -62,20 +72,13 @@ impl Geometry {
     }
 }
 
-/// A single 3x3 convolution's parameters, in the layout each backend wants.
+/// A single 3x3 convolution's parameters.
 pub struct Conv {
-    /// [c_out][c_in][3][3] - the checkpoint's own order (CUDA layout).
+    /// [c_out][c_in][3][3] - the checkpoint's own order, which is also the
+    /// toolkit kernel's. The nine taps of one (oc, ci) pair are contiguous and
+    /// the channel stride is 9; the CPU twin's tap loop reads exactly that, so
+    /// there is no transposed copy to hold.
     pub w: Vec<f32>,
-    /// [c_out][3][3][c_in], the INPUT CHANNEL innermost, for the CPU twin: the
-    /// reduction over ci is its inner loop, and here consecutive ci are
-    /// consecutive addresses, so each tap's weights are one contiguous run the
-    /// vectoriser can load a block at a time.
-    ///
-    /// The checkpoint's own [c_out][c_in][3][3] (in `w`) makes that same loop
-    /// stride by 9 floats per ci, so every weight load lands in a different cache
-    /// line and nothing vectorises. Reordering by (ky, kx, ci) for one output
-    /// element does not change: only the address of each weight moves.
-    pub w_cpu_ci: Vec<f32>,
     pub bias: Vec<f32>,
     pub c_out: usize,
 }
@@ -91,15 +94,7 @@ impl Conv {
     fn new(w: &[f32], bias: &[f32], c_in: usize, c_out: usize) -> Conv {
         assert_eq!(w.len(), c_out * c_in * 9, "conv weight size");
         assert_eq!(bias.len(), c_out, "conv bias size");
-        let mut w_cpu_ci = vec![0.0f32; w.len()];
-        for oc in 0..c_out {
-            for ci in 0..c_in {
-                for k in 0..9 {
-                    w_cpu_ci[(oc * 9 + k) * c_in + ci] = w[(oc * c_in + ci) * 9 + k];
-                }
-            }
-        }
-        Conv { w: w.to_vec(), w_cpu_ci, bias: bias.to_vec(), c_out }
+        Conv { w: w.to_vec(), bias: bias.to_vec(), c_out }
     }
 
     fn load(w: &Weights, name: &str) -> Result<Conv, String> {
@@ -244,9 +239,29 @@ pub fn leaky_relu(v: f32) -> f32 {
 /// 3x3, stride 1, pad 1, reading the first `c_in` channels of `src` (which may
 /// be a wider workspace) and writing into `dst`'s `c_out` channels.
 ///
-/// `res` adds `scale * res[i]` after the optional activation; `bias + sum`
-/// is accumulated in the order (ky, kx, ci) so this matches the CUDA kernel
-/// bit-for-bit on the short reductions the network is built from.
+/// `res` adds `scale * res[i]` after the optional activation.
+///
+/// THE CONVOLUTION IS THE TOOLKIT'S, NOT THIS ENGINE'S. There used to be a kernel
+/// here: a row-band-parallel AVX2 3x3 with the output channels blocked three at a
+/// time, an interior register tile, and an `axpy_span` fallback for the row ends.
+/// `lightgpu::ops::cpu::conv3x3s1p1` is that same kernel - two output channels per
+/// task, four `__m256` accumulators each, all 27 taps in registers - and it is the
+/// one every engine in the family calls, so the copy is gone. What is left here is
+/// the adapter: the twin for the convolution, then the activation and the residual,
+/// which are graph concerns rather than convolution ones. The whole 350-conv
+/// network therefore runs through one kernel that other engines exercise too, and
+/// `--bench-conv` measures the same one.
+///
+/// THE ARITHMETIC AGREES TO ROUND-OFF, NOT TO THE BIT. Both accumulate the bias
+/// first and then one fused multiply-add per tap in (ky, kx, ci) order, so the
+/// twin's output on `conv_first` is EXACTLY this engine's `conv3x3_reference`
+/// scalar (checked element by element) - but the twin's vector body is a
+/// different instruction stream from the OLD kernel's, and the old kernel's
+/// output differs from both by about 2.4e-07 on that first stage. Over 350
+/// convolutions that compounds: measured against the pre-adoption binary on a
+/// 128x128 input, 7.4e-05 on the last feature plane before the head, which is ONE
+/// 8-bit level on 24 pixels out of 786432 of the final PNG. `REALESRGAN_REF=1`
+/// runs `conv3x3_reference` instead, to see the scalar end of the same spread.
 #[allow(clippy::too_many_arguments)]
 fn conv3x3_prefix(
     src: &[f32],
@@ -261,240 +276,42 @@ fn conv3x3_prefix(
     let hw = h * w;
     let c_out = conv.c_out;
     // LA_PROFILE=1 accumulates wall time per (c_in, c_out, h, w) shape, so a
-    // change here can be attributed to a shape instead of guessed at.
+    // change here can be attributed to a shape instead of guessed at. The same
+    // variable also brackets each CUDA launch in cuda.rs, which is why the
+    // variable and the report outlived the kernel it was written for.
     let profiling = std::env::var("LA_PROFILE").map(|v| v == "1").unwrap_or(false);
     let t0 = if profiling { Some(std::time::Instant::now()) } else { None };
-    // Output channels are INDEPENDENT - each writes its own plane of `dst` and
-    // reads only `src` and its own weight slice - so this parallelises over oc
-    // with no synchronisation, and every element still accumulates in (ky, kx,
-    // ci) order.
-    //
-    // The unit of work is a ROW BAND of one channel, not a whole channel plane:
-    // there are only c_out planes (32 or 64 here) against 24 hardware threads,
-    // which is too coarse to load-balance. `band_rows` must divide `h` so no band
-    // spans two channels; when no split exists (h prime, as in the selftest's
-    // 37x29 shape) nband is 1 and this is the old whole-plane task.
-    //
-    // Each task holds a row of TX output pixels in registers. For one tap the
-    // weight is a single scalar shared by all TX pixels and the input is a
-    // contiguous span of TX+2 floats, so the inner loop is a streaming AXPY that
-    // vectorises - unlike the pixel-at-a-time form, whose weight index steps by
-    // 9 and whose input index steps by hw.
-    //
-    // The (ky, kx, ci) accumulation order is load-bearing: the selftest and the
-    // stage-dump parity checks are established against it. Preserving it is NOT
-    // the same as being bit-identical to the scalar code: the vector path uses a
-    // real fused multiply-add while a scalar build emits a separate multiply and
-    // add, which is 1 unit out of 255 on 455 of 1,048,576 pixels at this size.
-    // The fused form is the more accurate of the two, so the difference is in
-    // the right direction, but it is a difference.
-    // The tile width, and the ONLY source of truth for both the kernel's N
-    // template argument and the accumulator arrays' size. There is no runtime
-    // override: the two numbers must agree, and the GPU side has paid for a
-    // duplicated number three times.
-    const TX: usize = 32;
-    let txv: usize = TX;
-    let w_ci = &conv.w_cpu_ci[..];
-    // Aim for several tasks per hardware thread; more tasks than that only adds
-    // scheduling overhead, and the band loop itself is the same either way.
-    let nthreads = rayon::current_num_threads().max(1);
-    let want = (4 * nthreads).div_ceil(c_out.max(1)).max(1);
-    let nband = [8usize, 4, 2, 1]
-        .into_iter()
-        .find(|&n| h % n == 0 && n >= want)
-        .unwrap_or(1);
-    let band_rows = h / nband;
-    // OUTPUT-CHANNEL BLOCKING. OC adjacent channels are computed in ONE pass, so
-    // a loaded input vector feeds OC FMAs instead of one. Three is the measured
-    // optimum (end-to-end 256px: OC=1 9.53 s, OC=2 7.12 s, OC=3 6.71 s); OC=4
-    // loses because 4 channels x 4 ymm accumulators fill the 16-register file and
-    // leave nothing for the weight broadcast.
-    //
-    // The accumulation order per output element is untouched - each channel still
-    // sees the (ky, kx, ci) sequence, merely interleaved with another channel's -
-    // so the result matches the OC=1 code, which the stage-dump parity check
-    // against torch verifies.
-    //
-    // LA_OC=1/2 force the other widths, so they can be interleaved in time.
-    let oc_group: usize = match std::env::var("LA_OC").ok().and_then(|v| v.parse::<usize>().ok()) {
-        Some(1) => 1,
-        Some(2) => 2,
-        _ => 3,
-    };
-    // Rows and output channels must both be parallel, and a row band spanning
-    // several channels is not contiguous in `dst`, so the task list is built
-    // explicitly: one band of one channel group per task. Task count is
-    // (c_out/oc_group) * nband - chunking by channel group alone left only 32
-    // tasks for a 64-channel conv and cost more in parallelism than the blocking
-    // gained. The slices are disjoint by construction, so no unsafe is needed.
-    //
-    // Each channel plane is MOVED out of `planes` one group at a time, so the
-    // borrows going into a task are the only live ones for those planes.
-    let mut planes: Vec<&mut [f32]> = dst[..c_out * hw].chunks_mut(hw).collect();
-    let mut tasks: Vec<BandTask> = Vec::with_capacity((c_out / oc_group) * nband);
-    // One Vec of band slices per band index, across all channels: each plane is
-    // taken out of `planes` and split, so the band slices are owned and do not
-    // borrow the loop's locals.
-    let mut by_band: Vec<Vec<&mut [f32]>> = (0..nband).map(|_| Vec::with_capacity(c_out)).collect();
-    for o in 0..c_out {
-        let plane = std::mem::take(&mut planes[o]);
-        for (bi, chunk) in plane.chunks_mut(band_rows * w).enumerate() {
-            by_band[bi].push(chunk);
+    if std::env::var("REALESRGAN_REF").map(|v| v == "1").unwrap_or(false) {
+        conv3x3_reference(src, c_in, dst, conv, h, w, act, res);
+        if let Some(t0) = t0 {
+            CPU_PROFILE.lock().unwrap().push((c_in, c_out, h, w, act, t0.elapsed().as_secs_f64()));
         }
+        return;
     }
-    drop(planes);
-    let mut bands_iter: Vec<std::vec::IntoIter<&mut [f32]>> =
-        by_band.into_iter().map(|v| v.into_iter()).collect();
-    // A CEILING number of groups, so the last may hold fewer than oc_group
-    // channels. A partial group takes the general path, which re-reads the input
-    // for its one channel - 1/c_out of the work at the un-blocked rate.
-    let ngroups = c_out.div_ceil(oc_group);
-    for g in 0..ngroups {
-        let oc_base = g * oc_group;
-        let n_oc = oc_group.min(c_out - oc_base);
-        let mut pending: Vec<(usize, Vec<&mut [f32]>)> = Vec::with_capacity(nband);
-        for (bi, it) in bands_iter.iter_mut().enumerate() {
-            let mut per: Vec<&mut [f32]> = Vec::with_capacity(n_oc);
-            for _ in 0..n_oc {
-                per.push(it.next().expect("band has one slice per channel"));
-            }
-            pending.push((bi, per));
-        }
-        for (bi, per) in pending {
-            tasks.push(BandTask { oc_base, y0: bi * band_rows, per });
-        }
-    }
-    tasks.into_par_iter().for_each(|t| {
-        let BandTask { oc_base, y0, mut per } = t;
-        let n_oc = per.len();
-        let y1 = y0 + band_rows;
-        let mut acc = [0f32; TX];
-        let mut acc1 = [0f32; TX];
-        let mut acc2 = [0f32; TX];
-        for y in y0..y1 {
-            let yy = y - y0;
-            let mut x0 = 0usize;
-            while x0 < w {
-                let nx = txv.min(w - x0);
-                #[cfg(target_arch = "x86_64")]
-                let interior = nx == txv
-                    && x0 > 0
-                    && x0 + txv < w
-                    && is_x86_feature_detected!("avx2")
-                    && is_x86_feature_detected!("fma");
-                #[cfg(not(target_arch = "x86_64"))]
-                let interior = false;
-                // ---- fused interior tile: `n_oc` channels in one tap pass ----
-                #[cfg(target_arch = "x86_64")]
-                if interior && n_oc >= 1 {
-                    // N is the module's TX, so the kernel's width and the
-                    // accumulator arrays' length are the same number by
-                    // construction - nothing here can ask for a width the arrays
-                    // do not have. The width is a const generic, so the
-                    // accumulator sets stay in registers.
-                    unsafe {
-                        match n_oc {
-                            1 => conv3x3_tile_interior_oc_avx2::<{ TX }, 1>(
-                                src, w_ci, [conv.bias[oc_base]], c_in, oc_base, hw, h, w, y, x0,
-                                &mut [&mut acc[..]],
-                            ),
-                            2 => conv3x3_tile_interior_oc_avx2::<{ TX }, 2>(
-                                src, w_ci, [conv.bias[oc_base], conv.bias[oc_base + 1]], c_in,
-                                oc_base, hw, h, w, y, x0,
-                                &mut [&mut acc[..], &mut acc1[..]],
-                            ),
-                            _ => conv3x3_tile_interior_oc_avx2::<{ TX }, 3>(
-                                src, w_ci,
-                                [conv.bias[oc_base], conv.bias[oc_base + 1], conv.bias[oc_base + 2]],
-                                c_in, oc_base, hw, h, w, y, x0,
-                                &mut [&mut acc[..], &mut acc1[..], &mut acc2[..]],
-                            ),
-                        }
-                    };
-                    let accs = [&acc, &acc1, &acc2];
-                    for o in 0..n_oc {
-                        let oc = oc_base + o;
-                        let row = &mut per[o][yy * w..yy * w + w];
-                        for t in 0..nx {
-                            let mut v = if act { leaky_relu(accs[o][t]) } else { accs[o][t] };
-                            if let Some((r, s)) = res {
-                                v += s * r[oc * hw + y * w + x0 + t];
-                            }
-                            row[x0 + t] = v;
-                        }
-                    }
-                    x0 += nx;
-                    continue;
+    // The twin writes `c_out * hw` elements and folds the bias in first, so the
+    // epilogue below must NOT add it again.
+    lg_conv3x3s1p1(src, &conv.w, &conv.bias, dst, c_in, c_out, h, w);
+    // The epilogue is the graph's, not the convolution's: the twin has no
+    // activation and no residual, and folding the bias into the accumulator is
+    // the one thing it does that used to live in the kernel's tail.
+    if act || res.is_some() {
+        for oc in 0..c_out {
+            let row = &mut dst[oc * hw..(oc + 1) * hw];
+            for (i, v) in row.iter_mut().enumerate() {
+                let mut x = *v;
+                if act {
+                    x = leaky_relu(x);
                 }
-                // ---- general path, one channel at a time: the first and last
-                // tile of a row, remainder channels, and non-AVX2 builds ----
-                for o in 0..n_oc {
-                    let oc = oc_base + o;
-                    let b = conv.bias[oc];
-                    acc[..nx].fill(b);
-                    for ky in 0..3usize {
-                        let iy = y_iter(y, ky, h);
-                        let iy = match iy {
-                            Some(v) => v,
-                            None => continue,
-                        };
-                        for kx in 0..3usize {
-                            let k = ky * 3 + kx;
-                            let mut lo = 0usize;
-                            let mut hi = nx;
-                            if kx == 0 && x0 == 0 {
-                                lo = 1;
-                            }
-                            if kx == 2 && x0 + nx == w {
-                                hi = nx - 1;
-                            }
-                            if lo >= hi {
-                                continue;
-                            }
-                            let base = x0 + lo + kx - 1;
-                            let wtap = &w_ci[(oc * 9 + k) * c_in..][..c_in];
-                            for ci in 0..c_in {
-                                let wv = wtap[ci];
-                                let span = &src[ci * hw + iy * w + base
-                                                ..ci * hw + iy * w + base + (hi - lo)];
-                                axpy_span(wv, span, &mut acc[lo..hi]);
-                            }
-                        }
-                    }
-                    let row = &mut per[o][yy * w..yy * w + w];
-                    for t in 0..nx {
-                        let mut v = if act { leaky_relu(acc[t]) } else { acc[t] };
-                        if let Some((r, s)) = res {
-                            v += s * r[oc * hw + y * w + x0 + t];
-                        }
-                        row[x0 + t] = v;
-                    }
+                if let Some((r, s)) = res {
+                    x += s * r[oc * hw + i];
                 }
-                x0 += nx;
+                *v = x;
             }
         }
-    });
+    }
     if let Some(t0) = t0 {
-        // Only the calling thread's view is recorded; rayon tasks are joined
-        // above, so the elapsed time spans the whole parallel region.
-        CPU_PROFILE.lock().unwrap().push((
-            c_in,
-            c_out,
-            h,
-            w,
-            act,
-            t0.elapsed().as_secs_f64(),
-        ));
+        CPU_PROFILE.lock().unwrap().push((c_in, c_out, h, w, act, t0.elapsed().as_secs_f64()));
     }
-}
-
-/// One parallel unit of the CPU conv: a row band, in every channel of one
-/// output-channel group.
-struct BandTask<'a> {
-    oc_base: usize,
-    y0: usize,
-    /// One band slice per channel of the group, already offset to row `y0`.
-    per: Vec<&'a mut [f32]>,
 }
 
 /// Per-shape CPU conv timings, filled when LA_PROFILE=1 and reported at exit.
@@ -534,120 +351,63 @@ pub fn cpu_profile_report() {
     }
 }
 
-/// Up to three output channels of one interior N-pixel row tile in ONE pass over
-/// the taps, so a loaded input vector feeds OC FMAs instead of one.
+/// The SCALAR reference the toolkit twin is measured against: `(ky, kx, ci)`, one
+/// output pixel at a time, with the bias as the accumulator's initial value.
 ///
-/// NUMERICS: each output element still accumulates in (ky, kx, ci) order, the
-/// channels' chains merely interleaved in the instruction stream, so lane j of
-/// channel o receives the sequence it would have alone - identical to the
-/// one-channel kernel, which the stage-dump parity check against torch verifies.
-/// OC is a const generic, so the accumulator sets stay in registers.
+/// This is reached with `REALESRGAN_REF=1` and exists so a swap of the kernel under
+/// `conv3x3_prefix` can be JUDGED rather than merely timed. Run the same image
+/// twice, once on the twin and once here, and diff the two stage dumps. What that
+/// showed when the twin replaced this engine's own AVX2 kernel on a 128x128 input:
+/// the twin is element-for-element EXACTLY this scalar on `conv_first`, while the
+/// kernel it replaced was off by 2.4e-07 there; by the last feature plane before
+/// the head the twin and the old kernel differ by 7.4e-05, which is one 8-bit level
+/// on 24 pixels out of 786432 of the final PNG. So this is a round-off-level
+/// change in an accumulation order, not an implementation of a different op - and
+/// the numbers above are the whole size of it, not an impression of it.
 ///
-/// Interior tiles only (every lane valid for every tap); the caller uses the
-/// general path for a row's first and last tile and for a partly-filled group.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn conv3x3_tile_interior_oc_avx2<const N: usize, const OC: usize>(
+/// It is deliberately not vectorised and not parallel: it has one job, which is to
+/// be obviously right.
+#[allow(clippy::too_many_arguments)]
+fn conv3x3_reference(
     src: &[f32],
-    w_ci: &[f32],
-    biases: [f32; OC],
     c_in: usize,
-    oc: usize,
-    hw: usize,
+    dst: &mut [f32],
+    conv: &Conv,
     h: usize,
     w: usize,
-    y: usize,
-    x0: usize,
-    outs: &mut [&mut [f32]; OC],
+    act: bool,
+    res: Option<(&[f32], f32)>,
 ) {
-    use core::arch::x86_64::*;
-    // One accumulator register set per output channel; with OC and N const, this
-    // is a fixed register allocation and nothing touches memory in the tap loop.
-    let mut a = [[_mm256_set1_ps(0.0); 8]; OC];
-    for o in 0..OC {
-        let mut q = 0usize;
-        while q < N {
-            a[o][q / 8] = _mm256_set1_ps(biases[o]);
-            q += 8;
-        }
-    }
-    for ky in 0..3usize {
-        let iy = y as isize + ky as isize - 1;
-        if iy < 0 || iy as usize >= h {
-            continue;
-        }
-        let iy = iy as usize;
-        for kx in 0..3usize {
-            let k = ky * 3 + kx;
-            let base = x0 + kx - 1;
-            let mut wt = [core::ptr::null::<f32>(); OC];
-            for o in 0..OC {
-                wt[o] = w_ci.as_ptr().add(((oc + o) * 9 + k) * c_in);
-            }
-            for ci in 0..c_in {
-                let row = src.get_unchecked(ci * hw + iy * w + base..);
-                let mut j = 0usize;
-                while j < N {
-                    let v = _mm256_loadu_ps(row.as_ptr().add(j));
-                    for o in 0..OC {
-                        let wv = _mm256_set1_ps(*wt[o].add(ci));
-                        a[o][j / 8] = _mm256_fmadd_ps(wv, v, a[o][j / 8]);
+    let hw = h * w;
+    for oc in 0..conv.c_out {
+        let b = conv.bias[oc];
+        for y in 0..h {
+            for x in 0..w {
+                let mut acc = b;
+                for ky in 0..3usize {
+                    let iy = match y_iter(y, ky, h) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    for kx in 0..3usize {
+                        let ix = x as isize + kx as isize - 1;
+                        if ix < 0 || ix as usize >= w {
+                            continue;
+                        }
+                        let ix = ix as usize;
+                        let k = ky * 3 + kx;
+                        for ci in 0..c_in {
+                            acc += conv.w[(oc * c_in + ci) * 9 + k] * src[ci * hw + iy * w + ix];
+                        }
                     }
-                    j += 8;
                 }
+                let mut v = if act { leaky_relu(acc) } else { acc };
+                if let Some((r, s)) = res {
+                    v += s * r[oc * hw + y * w + x];
+                }
+                dst[oc * hw + y * w + x] = v;
             }
         }
-    }
-    for o in 0..OC {
-        let mut j = 0usize;
-        while j < N {
-            _mm256_storeu_ps(outs[o].as_mut_ptr().add(j), a[o][j / 8]);
-            j += 8;
-        }
-    }
-}
-
-/// `acc[j] += w * span[j]` for every j: the general path's inner loop.
-///
-/// The AVX2 path issues eight independent updates as one FMA, which preserves the
-/// per-lane accumulation sequence - lane j accumulates `w * span[j]` exactly where
-/// the scalar code would - so no reassociation is introduced.
-#[inline]
-fn axpy_span(w: f32, span: &[f32], acc: &mut [f32]) {
-    #[cfg(target_arch = "x86_64")]
-    {
-        // The feature test is hoisted by the compiler into a cfence-guarded
-        // branch; is_x86_feature_detected caches its result after the first call.
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            unsafe { axpy_span_avx2(w, span, acc) };
-            return;
-        }
-    }
-    for (a, s) in acc.iter_mut().zip(span.iter()) {
-        *a += w * s;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn axpy_span_avx2(w: f32, span: &[f32], acc: &mut [f32]) {
-    use core::arch::x86_64::*;
-    debug_assert_eq!(span.len(), acc.len());
-    let n = span.len();
-    let wv = _mm256_set1_ps(w);
-    let mut j = 0usize;
-    while j + 8 <= n {
-        let v = _mm256_loadu_ps(span.as_ptr().add(j));
-        let a = _mm256_loadu_ps(acc.as_ptr().add(j));
-        _mm256_storeu_ps(acc.as_mut_ptr().add(j), _mm256_fmadd_ps(wv, v, a));
-        j += 8;
-    }
-    // Always evaluate the remainder, even when it is empty: n is a runtime value
-    // that the compiler cannot prove is a multiple of 8, and the bounds are
-    // re-checked here rather than assumed.
-    while j < n {
-        *acc.get_unchecked_mut(j) += w * *span.get_unchecked(j);
-        j += 1;
     }
 }
 
