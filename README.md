@@ -118,6 +118,17 @@ The model files are about 64 MiB each. They are converted from the official
 upstream checkpoints and contain no Python pickle data; the engine reads them
 as standard safetensors files.
 
+```sh
+chmod +x realesrgan-linux-x86_64
+./realesrgan-linux-x86_64 --model RealESRGAN_x4plus.safetensors -i photo.png -o photo_4x.png
+```
+
+The `chmod` is not decoration: a download does not carry the executable bit
+through, and a binary that has lost it fails with `Permission denied` before it
+can print anything. The examples below write the program as `realesrgan`, which
+is the name `cargo build --release` produces - rename the download to that, or
+keep the full path.
+
 To build from source:
 
 ```sh
