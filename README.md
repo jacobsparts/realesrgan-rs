@@ -71,7 +71,7 @@ is what this project contributes back to.
   fastest direct convolution the hardware can run, and promoted into the
   toolkit's shared kernel set, where any engine can call it.
 * **Kernels are compiled per consumer.** A binary embeds only the kernels it
-  calls: this engine's fatbins carry 10 of the toolkit's 48 kernels plus one of
+  calls: this engine's fatbins carry 10 of the toolkit's 55 kernels plus one of
   its own, in two separately loaded modules, so a name collision or a mis-filed
   kernel fails at build time rather than mid-inference.
 * **Every kernel has a CPU twin** it is checked against on random data
