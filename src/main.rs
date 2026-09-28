@@ -251,9 +251,18 @@ fn main() {
         eprintln!("input: {} ({}x{})", src, img.w, img.h);
     }
 
+    // THE NETWORK SEES AN EVEN-SIZED IMAGE, AND THE RESULT IS CROPPED BACK.
+    // The x2 model's `pixel_unshuffle` halves the dimensions with an integer
+    // division, so an odd width would otherwise lose its last column (and the
+    // output plane would come back a different size from the one the caller
+    // asked for - see `Image::padded_even`). Padding here means both backends,
+    // the whole-image pass and the tiled one, see the same even image.
+    let padded = img.padded_even();
+    let (crop_w, crop_h) = (img.w * model.geom.scale, img.h * model.geom.scale);
+
     let t_fwd = Instant::now();
     let out = match device.as_str() {
-        "cpu" => run_cpu(&model, &img, quiet),
+        "cpu" => run_cpu(&model, &padded, quiet),
         "gpu" => {
             #[cfg(not(feature = "cuda"))]
             {
@@ -267,7 +276,7 @@ fn main() {
             #[cfg(feature = "cuda")]
             {
                 match cuda::Cuda::init(!quiet) {
-                    Ok(cuda) => match forward_tiled(cuda, model, &img, tile, tile_pad, quiet) {
+                    Ok(cuda) => match forward_tiled(cuda, model, &padded, tile, tile_pad, quiet) {
                         Ok(v) => v,
                         Err(e) => {
                             eprintln!("error: {e}");
@@ -289,7 +298,7 @@ fn main() {
                         // logs small still needs to know it got the CPU.
                         eprintln!("cuda: {e}");
                         eprintln!("cuda: falling back to the CPU backend (--gpu forces the GPU)");
-                        run_cpu(&model, &img, quiet)
+                        run_cpu(&model, &padded, quiet)
                     }
                 }
             }
@@ -303,7 +312,8 @@ fn main() {
         eprintln!("forward in {:.2}s", t_fwd.elapsed().as_secs_f64());
     }
 
-    let mut result = image::Image { w: out.w, h: out.h, data: out.data.clone() };
+    let mut result = image::Image { w: out.w, h: out.h, data: out.data.clone() }
+        .cropped(crop_w, crop_h);
     if let Some(s) = outscale {
         let want_w = (img.w as f64 * s).round() as usize;
         let want_h = (img.h as f64 * s).round() as usize;
@@ -380,7 +390,34 @@ fn forward_tiled(
 ) -> Result<net::Plane, String> {
     let (w, h) = (img.w, img.h);
     let scale = model.geom.scale;
-    let mut g = gpu::Gpu::new(cuda, model, w, h)?;
+
+    // `tile` is the interior size in INPUT pixels; `pad` is context added on
+    // each side. A tile of 0 (or one that covers the image) runs in one pass.
+    let tile_x = if tile == 0 { w } else { tile.min(w) };
+    let tile_y = if tile == 0 { h } else { tile.min(h) };
+
+    // THE FIRST ARENA IS SIZED FOR WHAT WILL ACTUALLY RUN, NOT FOR THE IMAGE.
+    // `Acts::alloc` is the only size-dependent allocation, and the whole-image
+    // one is what a 4x pass on a large photo cannot afford: the head planes are
+    // 16x the working area and a 725x1024 input needs about 9 GiB of them, which
+    // is why `--tile 256` used to die in `cuMemAlloc` before cutting a single
+    // tile - the tiling happened AFTER the allocation it was supposed to avoid.
+    //
+    // The first tile is the corner one, so its crop carries the pad only on its
+    // right and bottom and is the SMALLEST crop of the run; an interior tile
+    // carries it on all four sides and is what the arena has to hold. Sizing by
+    // the first tile therefore hands `resize` a slightly larger crop on the
+    // second tile - one more arena, as the doc comment on this function
+    // describes - and the peak is the interior size, `(tile + 2*pad)^2`, not the
+    // image. Padding the first tile by `pad` on the sides it does not have would
+    // make the first arena the largest one and save that rebuild; it is not done
+    // because a crop that reaches outside the image has no defined content.
+    let (first_cw, first_ch) = if tile_x == w && tile_y == h {
+        (w, h)
+    } else {
+        ((tile_x + pad).min(w), (tile_y + pad).min(h))
+    };
+    let mut g = gpu::Gpu::new(cuda, model, first_cw, first_ch)?;
     let out_w = w * scale;
     let out_h = h * scale;
     let mut out = net::Plane {
@@ -390,10 +427,6 @@ fn forward_tiled(
         data: vec![0f32; 3 * out_w * out_h],
     };
 
-    // `tile` is the interior size in INPUT pixels; `pad` is context added on
-    // each side. A tile of 0 (or one that covers the image) runs in one pass.
-    let tile_x = if tile == 0 { w } else { tile.min(w) };
-    let tile_y = if tile == 0 { h } else { tile.min(h) };
     if tile_x == w && tile_y == h {
         let v = g.forward(&img.data)?;
         out.data = v;

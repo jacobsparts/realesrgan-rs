@@ -101,6 +101,82 @@ pub fn load_rgb_stream<R: Read>(src: R) -> Result<Image, String> {
     Ok(img)
 }
 
+impl Image {
+    /// The image reflected out to even width and height, and the size it was.
+    ///
+    /// WHY THIS EXISTS: the x2 model begins with `pixel_unshuffle(2)`, whose
+    /// output is `[c*4][h/2][w/2]` - an INTEGER division, in the reference as
+    /// much as here. An odd width therefore loses a column of input at the very
+    /// first stage and the two nearest-neighbour upsampling stages give back
+    /// `2*(w/2)`, which is `w` rounded DOWN to even: a 725x1024 photo came out
+    /// 1448x2048 instead of 1450x2048 on the CPU, and on the GPU the same
+    /// truncated plane met an output buffer sized 725*2 and the writer indexed
+    /// past its end. The reference script has the same constraint and answers it
+    /// the same way - pad the input to a multiple of the scale, run, then crop
+    /// the result to `w*scale` - so that is what this does, with a REFLECT pad
+    /// (torch's `mode="reflect"`, which is what ImageOps and the reference use).
+    ///
+    /// One pixel is always enough: only the parity of the dimension matters here.
+    pub fn padded_even(&self) -> Image {
+        let pw = self.w % 2;
+        let ph = self.h % 2;
+        if pw == 0 && ph == 0 {
+            return Image { w: self.w, h: self.h, data: self.data.clone() };
+        }
+        let (w, h) = (self.w + pw, self.h + ph);
+        let hw = w * h;
+        let mut out = Image { w, h, data: vec![0.0; 3 * hw] };
+        for c in 0..3 {
+            let src = &self.data[c * self.w * self.h..(c + 1) * self.w * self.h];
+            let dst = &mut out.data[c * hw..(c + 1) * hw];
+            for y in 0..h {
+                // Reflected source row (the last row mirrors the one before it).
+                // A single-pixel axis cannot reflect, so that degenerate case
+                // replicates instead of underflowing - torch refuses `reflect`
+                // there too, and an image one pixel wide is not worth an error.
+                let sy = if y < self.h {
+                    y
+                } else if self.h >= 2 {
+                    2 * self.h - 2 - y
+                } else {
+                    0
+                };
+                for x in 0..w {
+                    let sx = if x < self.w {
+                        x
+                    } else if self.w >= 2 {
+                        2 * self.w - 2 - x
+                    } else {
+                        0
+                    };
+                    dst[y * w + x] = src[sy * self.w + sx];
+                }
+            }
+        }
+        out
+    }
+
+    /// The top-left `w x h` region, as an owned image. The inverse of the pad
+    /// above: the padded run's detail is all inside this rectangle, and what was
+    /// reflected into the margin is discarded.
+    pub fn cropped(&self, w: usize, h: usize) -> Image {
+        assert!(w <= self.w && h <= self.h, "crop {w}x{h} from a {}x{} image", self.w, self.h);
+        if w == self.w && h == self.h {
+            return Image { w, h, data: self.data.clone() };
+        }
+        let hw = w * h;
+        let mut out = Image { w, h, data: vec![0.0; 3 * hw] };
+        for c in 0..3 {
+            let src = &self.data[c * self.w * self.h..(c + 1) * self.w * self.h];
+            let dst = &mut out.data[c * hw..(c + 1) * hw];
+            for y in 0..h {
+                dst[y * w..(y + 1) * w].copy_from_slice(&src[y * self.w..y * self.w + w]);
+            }
+        }
+        out
+    }
+}
+
 /// Write 8-bit RGB.
 pub fn save_rgb(path: &str, w: usize, h: usize, rgb: &[u8]) -> Result<(), String> {
     let file = File::create(path).map_err(|e| format!("create {}: {}", path, e))?;
