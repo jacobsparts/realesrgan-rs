@@ -30,8 +30,7 @@ OPTIONS:
     -i, --input <path>    input PNG, or - for stdin (default: stdin)
     -o, --output <path>   output PNG, or - for stdout (default: stdout)
         --device <dev>    gpu or cpu (default: gpu when the CUDA driver can be
-                          brought up, cpu otherwise; a CPU-only build is always
-                          cpu)
+                          brought up, cpu otherwise)
         --tile <n>        process in tiles of n pixels, 0 = whole image (default 0)
         --tile-pad <n>    overlap around each tile (default 10)
         --outscale <f>    resize the result to this final scale (default: model scale)
